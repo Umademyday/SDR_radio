@@ -31,6 +31,11 @@ import math
 import subprocess
 import sys
 
+# The stdlib module is named `signal` and so is scipy's DSP module, which this
+# file leans on heavily. Importing the handful of process-signal names directly
+# keeps `signal.firwin` and friends unambiguous.
+from signal import SIG_DFL, SIGINT, SIGTERM, signal as install_signal_handler
+
 import numpy as np
 from scipy import signal
 
@@ -63,8 +68,43 @@ BLOCK_DURATION_S = READ_BLOCK_SAMPLES / CAPTURE_SAMPLE_RATE_HZ  # ~164 ms
 
 BROADCAST_PEAK_DEVIATION_HZ = 75_000.0  # full modulation -> full audio scale
 DC_BLOCKER_POLE = 0.999  # high-pass corner at about 8 Hz at 50 kS/s
-DEFAULT_VOLUME = 0.8
+# 0.7 rather than something closer to 1.0: heavily processed broadcast audio
+# overshoots the nominal 75 kHz deviation, and sox's resampler needs headroom
+# or it reports `rate clipped N samples`.
+DEFAULT_VOLUME = 0.7
 SHUTDOWN_GRACE_S = 2.0  # how long a child gets to exit before it is killed
+
+
+class StopRequest:
+    """Lets the pump loop exit cleanly however the stop arrives.
+
+    Ctrl-C is only one way out. PyCharm's Stop button sends SIGTERM, and
+    PyCharm's Run console does not even deliver Ctrl-C unless "Emulate terminal
+    in output console" is enabled. Catching KeyboardInterrupt alone therefore
+    left `rtl_sdr` and `play` orphaned, still holding the dongle and the audio
+    device. Both signals now set a flag that the loop checks between blocks, so
+    the ordinary teardown always runs.
+
+    A second signal restores the default handler, so an impatient second Ctrl-C
+    still kills the process outright.
+    """
+
+    STOP_SIGNALS = (SIGINT, SIGTERM)
+
+    def __init__(self) -> None:
+        self._requested = False
+
+    def install_handlers(self) -> None:
+        for stop_signal in self.STOP_SIGNALS:
+            install_signal_handler(stop_signal, self._handle)
+
+    def _handle(self, received_signal: int, _frame) -> None:
+        self._requested = True
+        install_signal_handler(received_signal, SIG_DFL)
+
+    @property
+    def requested(self) -> bool:
+        return self._requested
 
 
 class PolyphaseDecimator:
@@ -267,12 +307,26 @@ def read_exactly(stream, byte_count: int) -> bytes:
     return b"".join(chunks)
 
 
+def report_progress(receiver: FmReceiver, elapsed_s: float, overwrite: bool) -> None:
+    """One status line. A PyCharm console is not a terminal and ignores '\\r',
+    so there the line is reprinted at intervals instead of spamming every block."""
+    status = (
+        f"{elapsed_s:6.1f} s   "
+        f"deviation {receiver.last_deviation_rms_hz / 1e3:5.1f} kHz rms   "
+        f"audio {receiver.last_audio_peak_fraction * 100:5.1f} % of full scale"
+    )
+    print(f"\r{status}" if overwrite else status, end="" if overwrite else "\n", flush=True)
+
+
 def receive_until_interrupted(
     station_hz: float, gain_db: float | str, receiver: FmReceiver, seconds: float | None
 ) -> None:
     """Pump blocks from the dongle to the speakers until Ctrl-C or the time limit."""
+    stop = StopRequest()
+    stop.install_handlers()
     dongle = open_dongle_stream(station_hz, gain_db)
     speakers = open_speakers()
+    console_overwrites = sys.stdout.isatty()
     block_bytes = READ_BLOCK_SAMPLES * BYTES_PER_COMPLEX_SAMPLE
     blocks_to_play = None if seconds is None else math.ceil(seconds / BLOCK_DURATION_S)
     blocks_played = 0
@@ -282,10 +336,17 @@ def receive_until_interrupted(
         f"{CAPTURE_SAMPLE_RATE_HZ / 1e6:.1f} MS/s -> "
         f"{LIVE_AUDIO_SAMPLE_RATE_HZ:,} Hz audio"
     )
-    print("Ctrl-C to stop.\n")
+    print(
+        "Ctrl-C to stop"
+        + ("" if console_overwrites else " (in PyCharm: the Stop button, or enable "
+           "'Emulate terminal in output console' in the run configuration)")
+        + ".\n"
+    )
 
     try:
-        while blocks_to_play is None or blocks_played < blocks_to_play:
+        while not stop.requested and (
+            blocks_to_play is None or blocks_played < blocks_to_play
+        ):
             raw_block = read_exactly(dongle.stdout, block_bytes)
             if len(raw_block) < block_bytes:
                 print("\nthe dongle stopped sending samples.", file=sys.stderr)
@@ -294,19 +355,17 @@ def receive_until_interrupted(
             iq_block = cu8_bytes_to_iq(np.frombuffer(raw_block, dtype=np.uint8))
             speakers.stdin.write(receiver.process(iq_block).tobytes())
             blocks_played += 1
-            print(
-                f"\r{blocks_played * BLOCK_DURATION_S:6.1f} s   "
-                f"deviation {receiver.last_deviation_rms_hz / 1e3:5.1f} kHz rms   "
-                f"audio {receiver.last_audio_peak_fraction * 100:5.1f} % of full scale",
-                end="",
-                flush=True,
+            report_progress(
+                receiver, blocks_played * BLOCK_DURATION_S, console_overwrites
             )
-    except KeyboardInterrupt:
-        print("\nstopped.")
+    except KeyboardInterrupt:  # Ctrl-C before the handlers were installed
+        pass
     except BrokenPipeError:
         print("\nerror: the audio player exited.", file=sys.stderr)
     finally:
+        print("\nstopping...")
         shut_down(dongle, speakers)
+        print("stopped.")
 
 
 def shut_down(dongle: subprocess.Popen, speakers: subprocess.Popen) -> None:
