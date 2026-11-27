@@ -72,6 +72,30 @@ def latest_window(audio_pcm16: np.ndarray, sample_count: int) -> np.ndarray:
     return normalised
 
 
+def triggered_window(audio_pcm16: np.ndarray, sample_count: int) -> np.ndarray:
+    """Like `latest_window`, but aligned to a rising zero crossing.
+
+    Without this the window starts wherever the block happens to end, so the
+    waveform slides sideways from frame to frame and reads as jitter even when
+    the audio is steady. A bench oscilloscope solves it the same way: start
+    drawing at a consistent point in the signal.
+
+    The newest crossing that still leaves a full window is chosen, so the
+    display stays as fresh as possible. Silence has no crossings; then this
+    falls back to simply showing the newest samples.
+    """
+    if audio_pcm16.size < 2 * sample_count:
+        return latest_window(audio_pcm16, sample_count)
+
+    recent = audio_pcm16[-2 * sample_count:]
+    candidate_starts = recent[: sample_count + 1]
+    rising_edges = np.flatnonzero(
+        (candidate_starts[:-1] <= 0) & (candidate_starts[1:] > 0)
+    )
+    start = int(rising_edges[-1]) if rising_edges.size else sample_count
+    return recent[start : start + sample_count].astype(np.float64) / INT16_MAX
+
+
 class AudioScope:
     """A window showing the most recent 20 ms of the audio being played."""
 
@@ -114,7 +138,7 @@ class AudioScope:
         if pending is None:
             return  # nothing new since the last tick, so nothing to redraw
 
-        self._line.set_ydata(latest_window(pending, self._sample_count))
+        self._line.set_ydata(triggered_window(pending, self._sample_count))
         self._figure.canvas.draw_idle()  # reuses the same line, no replotting
 
     def _on_window_closed(self, _event) -> None:

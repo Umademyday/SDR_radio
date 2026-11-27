@@ -66,9 +66,18 @@ AUDIO_DECIMATION_FACTOR = 6
 LIVE_AUDIO_SAMPLE_RATE_HZ = BASEBAND_SAMPLE_RATE_HZ // AUDIO_DECIMATION_FACTOR  # 50 kS/s
 
 # One USB read. Must be a multiple of 512 (librtlsdr) and of 36 (so both
-# decimators keep their phase from block to block). 294912 = 512*576 = 36*8192.
-READ_BLOCK_SAMPLES = 294_912
-BLOCK_DURATION_S = READ_BLOCK_SAMPLES / CAPTURE_SAMPLE_RATE_HZ  # ~164 ms
+# decimators keep their phase from block to block), i.e. a multiple of 4608.
+#
+# 73728 = 512*144 = 36*2048 is about 41 ms, so blocks arrive ~24 times a second.
+# That is the oscilloscope's frame rate -- the display can only refresh when new
+# audio exists -- and it also sets the delay between antenna and speaker.
+# It is deliberately 2048 audio samples, exactly twice the 20 ms the scope
+# shows, which gives the trigger a full window of candidate start points.
+READ_BLOCK_SAMPLES = 73_728
+BLOCK_DURATION_S = READ_BLOCK_SAMPLES / CAPTURE_SAMPLE_RATE_HZ  # ~41 ms
+
+# Blocks now arrive too fast to print one status line each.
+PROGRESS_INTERVAL_S = 0.5
 
 BROADCAST_PEAK_DEVIATION_HZ = 75_000.0  # full modulation -> full audio scale
 DC_BLOCKER_POLE = 0.999  # high-pass corner at about 8 Hz at 50 kS/s
@@ -316,6 +325,7 @@ def receive_until_interrupted(
     block_bytes = READ_BLOCK_SAMPLES * BYTES_PER_COMPLEX_SAMPLE
     blocks_to_play = None if seconds is None else math.ceil(seconds / BLOCK_DURATION_S)
     blocks_played = 0
+    next_report_s = 0.0
 
     print(
         f"tuned to {station_hz / 1e6:.1f} MHz, gain {gain_db} dB, "
@@ -344,9 +354,10 @@ def receive_until_interrupted(
             if on_audio_block is not None:
                 on_audio_block(audio_pcm16)
             blocks_played += 1
-            report_progress(
-                receiver, blocks_played * BLOCK_DURATION_S, console_overwrites
-            )
+            elapsed_s = blocks_played * BLOCK_DURATION_S
+            if elapsed_s >= next_report_s:
+                report_progress(receiver, elapsed_s, console_overwrites)
+                next_report_s = elapsed_s + PROGRESS_INTERVAL_S
     except KeyboardInterrupt:  # Ctrl-C before the handlers were installed
         pass
     except BrokenPipeError:
