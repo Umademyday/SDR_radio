@@ -14,7 +14,7 @@ Listening to Radio Nacional on 88.2 MHz, decoded sample by sample.
 | `fm_dsp.py` | The signal chain itself: filters, discriminator, de-emphasis. |
 | `decode_fm.py` | Offline: a recorded I/Q capture becomes a mono WAV file. |
 | `play_fm.py` | Live: dongle straight to the speakers, with an optional oscilloscope. |
-| `audio_scope.py` | The oscilloscope window, used only by `play_fm.py --scope`. |
+| `audio_scope.py` | The waveform + spectrum window, used only by `play_fm.py --scope`. |
 
 ## How radio becomes sound
 
@@ -40,7 +40,7 @@ python3 -m venv .venv
 .venv/bin/python3 -m pip install -r requirements.txt
 ```
 
-Listen live, with a window showing the waveform you are hearing:
+Listen live, with a window showing the waveform and spectrum of what you hear:
 
 ```bash
 .venv/bin/python3 play_fm.py --station 88.2 --scope
