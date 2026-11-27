@@ -1,0 +1,31 @@
+# --- local working notes -----------------------------------------------------
+# Project context for Claude Code. Local to this machine, not part of the
+# published project.
+CLAUDE.md
+
+# --- SDR captures and decoded audio ------------------------------------------
+# Raw I/Q is enormous: a 10-second capture at 1.8 MS/s is 36 MB. Recordings and
+# the WAVs decoded from them are data, not source -- keep them out of history.
+*.cu8
+*.iq
+*.raw
+*.wav
+
+# --- Python ------------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- PyCharm -----------------------------------------------------------------
+.idea/
+
+# --- macOS -------------------------------------------------------------------
+.DS_Store
