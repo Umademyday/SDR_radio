@@ -10,6 +10,7 @@ same format decode_fm.py reads from a file -- so both paths share one reader.
     python play_fm.py                 # Radio Nacional, 88.2 MHz
     python play_fm.py --station 101.3
     python play_fm.py --seconds 10    # stop by itself instead of Ctrl-C
+    python play_fm.py --station 88.2 --scope   # plus a live audio oscilloscope
 
 The only real difference from offline decoding is *continuity*: samples arrive in
 blocks, so every filter has to remember where the previous block left off.
@@ -30,29 +31,32 @@ import argparse
 import math
 import subprocess
 import sys
+import threading
 
 # The stdlib module is named `signal` and so is scipy's DSP module, which this
 # file leans on heavily. Importing the handful of process-signal names directly
 # keeps `signal.firwin` and friends unambiguous.
 from signal import SIG_DFL, SIGINT, SIGTERM, signal as install_signal_handler
 
+from typing import Callable
+
 import numpy as np
 from scipy import signal
 
-from decode_fm import (
+# The radio itself lives in fm_dsp, shared with the offline decoder.
+from fm_dsp import (
     BASEBAND_DECIMATION_FACTOR,
-    cu8_bytes_to_iq,
     BASEBAND_SAMPLE_RATE_HZ,
+    BYTES_PER_COMPLEX_SAMPLE,
     CAPTURE_SAMPLE_RATE_HZ,
-    DEEMPHASIS_TIME_CONSTANT_S,
     INT16_MAX,
-    MONO_AUDIO_CUTOFF_HZ,
-    PILOT_ATTENUATION_DB,
-    STATION_HALF_BANDWIDTH_HZ,
-    STEREO_PILOT_HZ,
+    cu8_bytes_to_iq,
+    deemphasis_coefficients,
+    design_mono_audio_filter,
+    design_station_filter,
+    discriminate_fm_to_hz,
 )
 
-BYTES_PER_COMPLEX_SAMPLE = 2
 AUTO_GAIN_FLAG = "0"  # rtl_sdr reads a gain of 0 as "let the tuner decide"
 
 DEFAULT_STATION_MHZ = 88.2  # Radio Nacional, Madrid
@@ -73,6 +77,7 @@ DC_BLOCKER_POLE = 0.999  # high-pass corner at about 8 Hz at 50 kS/s
 # or it reports `rate clipped N samples`.
 DEFAULT_VOLUME = 0.7
 SHUTDOWN_GRACE_S = 2.0  # how long a child gets to exit before it is killed
+SCOPE_JOIN_TIMEOUT_S = 10.0  # long enough for both children to be reaped
 
 
 class StopRequest:
@@ -94,7 +99,12 @@ class StopRequest:
     def __init__(self) -> None:
         self._requested = False
 
+    def request(self) -> None:
+        """Ask for a clean stop from code rather than from a signal."""
+        self._requested = True
+
     def install_handlers(self) -> None:
+        """Main thread only -- signal handlers cannot be installed elsewhere."""
         for stop_signal in self.STOP_SIGNALS:
             install_signal_handler(stop_signal, self._handle)
 
@@ -136,16 +146,15 @@ class PolyphaseDecimator:
 
 
 class FmDiscriminator:
-    """Phase-difference FM discriminator that remembers the previous sample.
+    """`fm_dsp.discriminate_fm_to_hz` with memory of the previous block.
 
-    Identical maths to decode_fm.discriminate_fm_to_hz -- angle of
-    iq[n] * conj(iq[n-1]), scaled by sample_rate / 2*pi -- except that the
-    "previous sample" for the first sample of a block is the last sample of the
-    block before it, so no sample is lost at the seam.
+    The maths is shared; all this adds is continuity. A difference needs two
+    samples, so the first sample of a block is paired with the last sample of
+    the block before it and nothing is lost at the seam.
     """
 
     def __init__(self, sample_rate_hz: float) -> None:
-        self._radians_to_hz = sample_rate_hz / (2.0 * math.pi)
+        self._sample_rate_hz = sample_rate_hz
         self._previous_sample: complex | None = None
 
     def process(self, iq: np.ndarray) -> np.ndarray:
@@ -153,7 +162,7 @@ class FmDiscriminator:
             self._previous_sample = iq[0]
         joined = np.concatenate(([self._previous_sample], iq))
         self._previous_sample = iq[-1]
-        return np.angle(joined[1:] * np.conj(joined[:-1])) * self._radians_to_hz
+        return discriminate_fm_to_hz(joined, self._sample_rate_hz)
 
 
 class StatefulIirFilter:
@@ -171,40 +180,9 @@ class StatefulIirFilter:
         return filtered
 
 
-def design_station_filter() -> np.ndarray:
-    """Anti-alias taps for 1.8 MS/s -> 300 kS/s, keeping the station's +/-100 kHz."""
-    return signal.firwin(
-        127,  # 126 = 21*6, so the decimation phase is preserved across blocks
-        cutoff=STATION_HALF_BANDWIDTH_HZ,
-        fs=CAPTURE_SAMPLE_RATE_HZ,
-    )
-
-
-def design_audio_filter() -> np.ndarray:
-    """15 kHz taps that also anti-alias the 300 kS/s -> 50 kS/s decimation.
-
-    One filter does both jobs: it keeps mono audio, buries the 19 kHz stereo
-    pilot, and clears everything above the new 25 kHz Nyquist.
-    """
-    transition_width_normalised = (STEREO_PILOT_HZ - MONO_AUDIO_CUTOFF_HZ) / (
-        BASEBAND_SAMPLE_RATE_HZ / 2
-    )
-    tap_count, kaiser_beta = signal.kaiserord(
-        PILOT_ATTENUATION_DB, transition_width_normalised
-    )
-    tap_count += -(tap_count - 1) % AUDIO_DECIMATION_FACTOR  # keep (taps-1) % 6 == 0
-    return signal.firwin(
-        tap_count,
-        cutoff=MONO_AUDIO_CUTOFF_HZ,
-        window=("kaiser", kaiser_beta),
-        fs=BASEBAND_SAMPLE_RATE_HZ,
-    )
-
-
 def make_deemphasis_filter() -> StatefulIirFilter:
-    """European 50 us de-emphasis as a single-pole IIR at the audio rate."""
-    pole = math.exp(-1.0 / (LIVE_AUDIO_SAMPLE_RATE_HZ * DEEMPHASIS_TIME_CONSTANT_S))
-    return StatefulIirFilter([1.0 - pole], [1.0, -pole])
+    """The shared 50 us de-emphasis curve, as a filter that carries state."""
+    return StatefulIirFilter(*deemphasis_coefficients(LIVE_AUDIO_SAMPLE_RATE_HZ))
 
 
 def make_dc_blocker() -> StatefulIirFilter:
@@ -225,7 +203,7 @@ class FmReceiver:
         )
         self._discriminator = FmDiscriminator(BASEBAND_SAMPLE_RATE_HZ)
         self._audio_decimator = PolyphaseDecimator(
-            design_audio_filter(), AUDIO_DECIMATION_FACTOR, np.float64
+            design_mono_audio_filter(), AUDIO_DECIMATION_FACTOR, np.float64
         )
         self._deemphasis = make_deemphasis_filter()
         self._dc_blocker = make_dc_blocker()
@@ -319,11 +297,19 @@ def report_progress(receiver: FmReceiver, elapsed_s: float, overwrite: bool) -> 
 
 
 def receive_until_interrupted(
-    station_hz: float, gain_db: float | str, receiver: FmReceiver, seconds: float | None
+    station_hz: float,
+    gain_db: float | str,
+    receiver: FmReceiver,
+    seconds: float | None,
+    stop: StopRequest,
+    on_audio_block: Callable[[np.ndarray], None] | None = None,
 ) -> None:
-    """Pump blocks from the dongle to the speakers until Ctrl-C or the time limit."""
-    stop = StopRequest()
-    stop.install_handlers()
+    """Pump blocks from the dongle to the speakers until Ctrl-C or the time limit.
+
+    `on_audio_block` receives the very same PCM array that was just played, so
+    the oscilloscope shows exactly what is audible and each block is decoded
+    only once. It must return quickly: it runs in the audio path.
+    """
     dongle = open_dongle_stream(station_hz, gain_db)
     speakers = open_speakers()
     console_overwrites = sys.stdout.isatty()
@@ -353,7 +339,10 @@ def receive_until_interrupted(
                 break
 
             iq_block = cu8_bytes_to_iq(np.frombuffer(raw_block, dtype=np.uint8))
-            speakers.stdin.write(receiver.process(iq_block).tobytes())
+            audio_pcm16 = receiver.process(iq_block)
+            speakers.stdin.write(audio_pcm16.tobytes())
+            if on_audio_block is not None:
+                on_audio_block(audio_pcm16)
             blocks_played += 1
             report_progress(
                 receiver, blocks_played * BLOCK_DURATION_S, console_overwrites
@@ -414,17 +403,68 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "--seconds", type=float, default=None,
         help="stop after this many seconds (default: run until Ctrl-C)",
     )
+    parser.add_argument(
+        "--scope", action="store_true",
+        help="also show a live oscilloscope of the decoded audio (needs matplotlib)",
+    )
     return parser.parse_args(argv)
+
+
+def run_with_scope(
+    station_hz: float,
+    gain_db: float | str,
+    receiver: FmReceiver,
+    seconds: float | None,
+    stop: StopRequest,
+) -> int:
+    """Play on a worker thread while the oscilloscope owns the main thread.
+
+    macOS will only run a GUI event loop on the main thread, and the audio pump
+    must never wait for a redraw, so the two swap places compared to the plain
+    CLI: the receiver moves to a background thread and hands finished audio
+    blocks over through a single slot.
+    """
+    try:
+        from audio_scope import AudioScope, LatestAudioBlock
+    except ImportError as error:
+        print(
+            f"error: --scope needs matplotlib ({error}).\n"
+            "    .venv/bin/python3 -m pip install matplotlib",
+            file=sys.stderr,
+        )
+        return 2
+
+    latest_block = LatestAudioBlock()
+
+    def pump_audio() -> None:
+        try:
+            receive_until_interrupted(
+                station_hz, gain_db, receiver, seconds, stop, latest_block.publish
+            )
+        finally:
+            stop.request()  # closes the window if playback ended on its own
+
+    receiver_thread = threading.Thread(target=pump_audio, name="fm-receiver", daemon=True)
+    receiver_thread.start()
+
+    AudioScope(LIVE_AUDIO_SAMPLE_RATE_HZ, station_hz / 1e6, latest_block, stop).run()
+    receiver_thread.join(timeout=SCOPE_JOIN_TIMEOUT_S)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = parse_arguments(argv)
     gain_db = "auto" if str(arguments.gain).lower() == "auto" else float(arguments.gain)
+    station_hz = arguments.station * 1e6
 
     receiver = FmReceiver(volume=arguments.volume)
-    receive_until_interrupted(
-        arguments.station * 1e6, gain_db, receiver, arguments.seconds
-    )
+    stop = StopRequest()
+    stop.install_handlers()  # here, because this is the main thread
+
+    if arguments.scope:
+        return run_with_scope(station_hz, gain_db, receiver, arguments.seconds, stop)
+
+    receive_until_interrupted(station_hz, gain_db, receiver, arguments.seconds, stop)
     return 0
 
 

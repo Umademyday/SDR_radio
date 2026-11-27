@@ -30,28 +30,26 @@ import numpy as np
 from scipy import signal
 from scipy.io import wavfile
 
-# --- Stage 1: the capture format, as documented for this recording -----------
-CAPTURE_SAMPLE_RATE_HZ = 1_800_000
-CU8_ZERO_LEVEL = 127.5  # midpoint of the unsigned 8-bit range 0..255
-CU8_FULL_SCALE = 127.5  # divisor that maps 0..255 onto about -1.0..+1.0
-BYTES_PER_COMPLEX_SAMPLE = 2  # one byte of I, one byte of Q
+# The radio itself lives in fm_dsp, shared with the live receiver in play_fm.
+from fm_dsp import (
+    BASEBAND_DECIMATION_FACTOR,
+    BASEBAND_SAMPLE_RATE_HZ,
+    BYTES_PER_COMPLEX_SAMPLE,
+    CAPTURE_SAMPLE_RATE_HZ,
+    DEEMPHASIS_TIME_CONSTANT_S,
+    INT16_MAX,
+    INT16_MIN,
+    MONO_AUDIO_CUTOFF_HZ,
+    STATION_HALF_BANDWIDTH_HZ,
+    cu8_bytes_to_iq,
+    deemphasis_coefficients,
+    design_mono_audio_filter,
+    design_station_filter,
+    discriminate_fm_to_hz,
+)
 
-# --- Stage 2: isolating the centred station ---------------------------------
-BASEBAND_DECIMATION_FACTOR = 6
-BASEBAND_SAMPLE_RATE_HZ = CAPTURE_SAMPLE_RATE_HZ // BASEBAND_DECIMATION_FACTOR  # 300 kS/s
-STATION_HALF_BANDWIDTH_HZ = 100_000  # a broadcast FM channel occupies about +/-100 kHz
-STATION_FILTER_TAP_COUNT = 129  # odd, so the FIR has an integer group delay
-
-# --- Stage 4: mono audio ----------------------------------------------------
-AUDIO_SAMPLE_RATE_HZ = 48_000
-MONO_AUDIO_CUTOFF_HZ = 15_000  # top of the mono (L+R) band
-STEREO_PILOT_HZ = 19_000  # must be in the stopband or it whistles in the audio
-PILOT_ATTENUATION_DB = 70.0
-DEEMPHASIS_TIME_CONSTANT_S = 50e-6  # Europe (the Americas and Korea use 75 us)
-
-# --- Stage 5: PCM output ----------------------------------------------------
-INT16_MAX = 32_767
-INT16_MIN = -32_768
+# --- what is specific to decoding a file ------------------------------------
+AUDIO_SAMPLE_RATE_HZ = 48_000  # the live receiver uses 50 kHz; see fm_dsp
 TARGET_PEAK_FRACTION = 0.95  # leave headroom so rounding cannot clip
 SILENCE_PEAK_THRESHOLD = 1e-9  # below this the capture is silence, not audio
 
@@ -83,97 +81,31 @@ def read_cu8_iq(capture_path: Path) -> np.ndarray:
     return cu8_bytes_to_iq(raw_bytes)
 
 
-def cu8_bytes_to_iq(raw_bytes: np.ndarray) -> np.ndarray:
-    """Convert interleaved unsigned 8-bit bytes into centred complex I/Q samples.
-
-    Shared by the offline decoder and the live player, because `rtl_sdr` emits
-    exactly the same bytes to a pipe as it writes to a file.
-    """
-    centred_samples = (raw_bytes.astype(np.float32) - CU8_ZERO_LEVEL) / CU8_FULL_SCALE
-    in_phase = centred_samples[0::2]
-    quadrature = centred_samples[1::2]
-    return (in_phase + 1j * quadrature).astype(np.complex64)
-
-
 def isolate_station(iq_at_capture_rate: np.ndarray) -> np.ndarray:
     """Low-pass to the station's own bandwidth, then decimate 1.8 MS/s -> 300 kS/s.
 
     The tuner was parked on the station, so the wanted signal already sits at
-    0 Hz and no mixing is needed. Everything beyond +/-100 kHz is a neighbouring
-    channel: it has to be filtered out *before* decimating, otherwise dropping
-    five of every six samples folds it back on top of our station (aliasing).
+    0 Hz and no mixing is needed. `upfirdn` filters and throws away the unused
+    outputs in one polyphase pass.
     """
-    anti_alias_taps = signal.firwin(
-        STATION_FILTER_TAP_COUNT,
-        cutoff=STATION_HALF_BANDWIDTH_HZ,
-        fs=CAPTURE_SAMPLE_RATE_HZ,
-    )
-    # upfirdn filters and throws away the unused outputs in one polyphase pass.
     iq_at_baseband_rate = signal.upfirdn(
-        anti_alias_taps, iq_at_capture_rate, down=BASEBAND_DECIMATION_FACTOR
+        design_station_filter(), iq_at_capture_rate, down=BASEBAND_DECIMATION_FACTOR
     )
     return iq_at_baseband_rate.astype(np.complex64)
 
 
-def discriminate_fm_to_hz(iq: np.ndarray, sample_rate_hz: float) -> np.ndarray:
-    """Recover instantaneous frequency deviation, in Hz, from complex I/Q.
-
-    FM stores the audio in the *rate of change* of the carrier's phase, so the
-    receiver has to differentiate the phase. Each sample is A*exp(j*phi[n]).
-    Multiplying a sample by the conjugate of its predecessor subtracts the
-    previous angle (exp(j*phi[n]) * exp(-j*phi[n-1]) == exp(j*(phi[n]-phi[n-1]))),
-    so np.angle of that product is exactly the phase advanced during one sample
-    period, already wrapped into (-pi, +pi] -- which is why no explicit phase
-    unwrapping is needed.
-
-    Converting that to Hz is just a change of units: one full cycle is 2*pi
-    radians and consecutive samples are 1/sample_rate seconds apart, so
-
-        deviation_hz = phase_change_rad / (2*pi) * sample_rate_hz
-
-    The result is the audio waveform: silence sits at 0 Hz deviation and a loud
-    passage swings out towards the +/-75 kHz broadcast limit.
-    """
-    phase_change_rad = np.angle(iq[1:] * np.conj(iq[:-1]))
-    return phase_change_rad * (sample_rate_hz / (2.0 * math.pi))
-
-
-def design_mono_audio_filter() -> np.ndarray:
-    """FIR taps that pass mono audio to 15 kHz and bury the 19 kHz pilot tone."""
-    transition_width_normalised = (STEREO_PILOT_HZ - MONO_AUDIO_CUTOFF_HZ) / (
-        BASEBAND_SAMPLE_RATE_HZ / 2
-    )
-    tap_count, kaiser_beta = signal.kaiserord(
-        PILOT_ATTENUATION_DB, transition_width_normalised
-    )
-    tap_count |= 1  # force odd for a symmetric, integer-delay filter
-    return signal.firwin(
-        tap_count,
-        cutoff=MONO_AUDIO_CUTOFF_HZ,
-        window=("kaiser", kaiser_beta),
-        fs=BASEBAND_SAMPLE_RATE_HZ,
-    )
-
-
-def apply_deemphasis(audio: np.ndarray, sample_rate_hz: float) -> np.ndarray:
-    """Undo the transmitter's treble boost with a 50 us single-pole RC filter.
-
-    FM broadcasters pre-emphasise high frequencies to lift them above the noise;
-    the receiver has to apply the mirror-image roll-off or everything sounds
-    harsh. A 50 us time constant corresponds to a -3 dB corner at about 3.2 kHz.
-    """
-    pole = math.exp(-1.0 / (sample_rate_hz * DEEMPHASIS_TIME_CONSTANT_S))
-    numerator = [1.0 - pole]  # scaled for unity gain at DC
-    denominator = [1.0, -pole]
-    return signal.lfilter(numerator, denominator, audio)
-
-
 def extract_mono_audio(deviation_hz_at_baseband_rate: np.ndarray) -> np.ndarray:
-    """Band-limit, de-emphasise and resample the discriminator output to 48 kHz."""
+    """Band-limit, de-emphasise and resample the discriminator output to 48 kHz.
+
+    Offline the whole capture is filtered in one pass, so no filter state has
+    to survive anything -- the one real difference from the live receiver.
+    """
     band_limited = signal.oaconvolve(
         deviation_hz_at_baseband_rate, design_mono_audio_filter(), mode="same"
     )
-    deemphasised = apply_deemphasis(band_limited, BASEBAND_SAMPLE_RATE_HZ)
+    deemphasised = signal.lfilter(
+        *deemphasis_coefficients(BASEBAND_SAMPLE_RATE_HZ), band_limited
+    )
 
     # 300 kS/s -> 48 kS/s is the exact ratio 8/50, so a rational resampler is
     # enough; no interpolation guesswork.
@@ -220,7 +152,7 @@ def decode_capture_to_wav(capture_path: Path, wav_path: Path) -> None:
         f"station       : {iq_at_baseband_rate.size:>10,} complex samples @ "
         f"{BASEBAND_SAMPLE_RATE_HZ:,} S/s  "
         f"(kept +/-{STATION_HALF_BANDWIDTH_HZ / 1e3:.0f} kHz, "
-        f"{STATION_FILTER_TAP_COUNT}-tap FIR, decimated by {BASEBAND_DECIMATION_FACTOR})"
+        f"{design_station_filter().size}-tap FIR, decimated by {BASEBAND_DECIMATION_FACTOR})"
     )
 
     deviation_hz = discriminate_fm_to_hz(iq_at_baseband_rate, BASEBAND_SAMPLE_RATE_HZ)

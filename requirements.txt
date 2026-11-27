@@ -1,0 +1,21 @@
+# SDR_radio dependencies.  Python 3.13 on Apple Silicon.
+#     .venv/bin/python3 -m pip install -r requirements.txt
+#
+# Not listed here, because they are not Python packages:
+#   librtlsdr >= 2.0  and  sox      ->  brew install librtlsdr sox
+# librtlsdr must be 2.0+ or the RTL-SDR Blog V4 tunes to the wrong frequency.
+
+# --- the receiver itself ---
+numpy==2.5.5
+scipy==1.18.1
+
+# --- only needed for `play_fm.py --scope` ---
+# Everything else runs without it; the oscilloscope prints an install hint
+# instead of failing if it is absent.
+matplotlib==3.11.2
+
+# --- deliberately NOT a dependency ---
+# pyrtlsdr: unusable with librtlsdr 2.0+.  It binds rtlsdr_set_dithering at
+# import time, a symbol only the older keenerd fork exports, so importing it
+# raises AttributeError.  The dongle is driven through the `rtl_sdr` command
+# instead -- see the note in play_fm.open_dongle_stream.
